@@ -1,0 +1,16 @@
+{
+  "name": "tableau-location",
+  "version": "1.0.0",
+  "description": "Tableau de location interactif partage (multi-utilisateurs)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo 'no build step'"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
