@@ -103,6 +103,24 @@ function cleanStr(v, maxLen) {
   if (!s) return null;
   return s.slice(0, maxLen);
 }
+function normalizeReturnedAt(value) {
+  if (value === undefined || value === null || value === '') return now();
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return now();
+    if (/^\d+$/.test(trimmed)) return Number(trimmed);
+    if (isValidISODate(trimmed)) {
+      const [y, m, d] = trimmed.split('-').map(Number);
+      return new Date(y, m - 1, d).getTime();
+    }
+  }
+  return null;
+}
+function isoDateToTimestamp(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
 
 // ---------- MIDDLEWARE ----------
 app.use(express.json({ limit: '256kb' }));
@@ -269,8 +287,8 @@ function findConflict(equipmentId, startDate, endDate, excludeRentalId = null) {
     SELECT * FROM rentals
     WHERE equipment_id = ?
       AND returned_at IS NULL
-      AND date(start_date) <= date(?)
-      AND date(end_date) >= date(?)
+      AND date(start_date) < date(?)
+      AND date(end_date) > date(?)
       ${excludeRentalId ? 'AND id != ?' : ''}
     LIMIT 1
   `;
@@ -489,7 +507,10 @@ app.put('/api/rentals/:id', (req, res) => {
     });
   }
 
-  const returned_at = req.body?.returned_at !== undefined ? req.body.returned_at : existing.returned_at;
+  const returned_at = req.body?.returned_at !== undefined ? normalizeReturnedAt(req.body.returned_at) : existing.returned_at;
+  if (req.body?.returned_at !== undefined && returned_at === null) {
+    return res.status(400).json({ error: 'Date de retour invalide.' });
+  }
   const ts = now();
   db.prepare(`UPDATE rentals SET client=?, phone=?, start_date=?, end_date=?, note=?, color=?, returned_at=?, updated_at=?, version=version+1 WHERE id=?`)
     .run(clean.client, clean.phone, clean.start_date, clean.end_date, clean.note, clean.color, returned_at, ts, id);
@@ -503,8 +524,13 @@ app.post('/api/rentals/:id/return', (req, res) => {
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
   if (existing.returned_at) return res.json(existing); // idempotent
+  const returnedAt = normalizeReturnedAt(req.body?.returned_at);
+  if (returnedAt === null) return res.status(400).json({ error: 'Date de retour invalide.' });
+  if (returnedAt < isoDateToTimestamp(existing.start_date)) {
+    return res.status(400).json({ error: 'La date de retour ne peut pas être avant la date de début.' });
+  }
   const ts = now();
-  db.prepare('UPDATE rentals SET returned_at = ?, updated_at = ?, version = version + 1 WHERE id = ?').run(ts, ts, id);
+  db.prepare('UPDATE rentals SET returned_at = ?, updated_at = ?, version = version + 1 WHERE id = ?').run(returnedAt, ts, id);
   const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   broadcast('rentals:changed', { action: 'updated', item: updated });
   res.json(updated);

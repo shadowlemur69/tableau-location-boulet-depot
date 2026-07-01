@@ -261,6 +261,27 @@
   </div>
 </div>
 
+<!-- MODAL: DATE DE RETOUR -->
+<div class="modal confirm-modal" id="returnModal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-card modal-small">
+    <div class="modal-header">
+      <h2 id="returnTitle">Confirmer la date de retour</h2>
+    </div>
+    <div class="confirm-body">
+      <p id="returnBody">Choisissez la date effective de retour.</p>
+      <label class="return-date-field">Date de retour
+        <input type="date" id="returnDateInput" required min="2000-01-01" max="2099-12-31" />
+      </label>
+    </div>
+    <div class="modal-actions">
+      <div class="spacer"></div>
+      <button type="button" class="btn btn-ghost" id="returnCancel">Annuler</button>
+      <button type="button" class="btn btn-primary" id="returnOk">Confirmer</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast" hidden></div>
 
 <script src="app.js"></script>

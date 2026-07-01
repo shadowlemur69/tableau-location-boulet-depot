@@ -473,6 +473,12 @@ main {
   transition: opacity 0.15s;
   box-shadow: 0 2px 4px rgba(20,48,16,0.2);
 }
+.day-cell .add-hint.add-hint-left {
+  left: 25%;
+}
+.day-cell .add-hint.add-hint-right {
+  left: 75%;
+}
 .day-cell:hover .add-hint { opacity: 0.85; }
 
 /* ============================================================
@@ -904,6 +910,18 @@ main {
   font-size: 15px;
 }
 .confirm-body p { margin: 0; }
+.return-date-field {
+  display: block;
+  margin-top: 14px;
+  font-weight: 600;
+}
+.return-date-field input {
+  margin-top: 6px;
+  width: 100%;
+  padding: 11px 12px;
+  font-size: 15px;
+  min-height: 44px;
+}
 
 /* Bouton restaurer petit */
 .btn-sm {

@@ -32,6 +32,11 @@ function addDays(date, n) {
   d.setDate(d.getDate() + n);
   return d;
 }
+function startOfDay(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
 function toISODate(date) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -43,6 +48,13 @@ function parseISODate(str) {
   const [y, m, d] = str.split('-').map(Number);
   const dt = new Date(y, m - 1, d);
   return isNaN(dt) ? null : dt;
+}
+function rentalEffectiveEndDate(rental) {
+  const plannedEnd = parseISODate(rental.end_date);
+  if (!plannedEnd) return null;
+  if (!rental.returned_at) return plannedEnd;
+  const returnedDay = startOfDay(new Date(rental.returned_at));
+  return returnedDay < plannedEnd ? returnedDay : plannedEnd;
 }
 function fmtDateShort(date) {
   return date.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short' });
@@ -261,14 +273,31 @@ function renderBody() {
       const rentalsStartingHere = rentals.filter(r => {
         if (r.equipment_id !== eq.id) return false;
         const s = parseISODate(r.start_date);
-        const e = parseISODate(r.end_date);
+        const e = rentalEffectiveEndDate(r);
         if (!s || !e) return false;
         const firstVisible = s < currentWeekStart ? currentWeekStart : s;
         if (e < currentWeekStart || s > weekEnd) return false;
         return isSameDay(firstVisible, day);
       });
+      const rentalsEndingHere = rentals.filter(r => {
+        if (r.equipment_id !== eq.id) return false;
+        const s = parseISODate(r.start_date);
+        const e = rentalEffectiveEndDate(r);
+        if (!s || !e) return false;
+        const lastVisible = e > weekEnd ? weekEnd : e;
+        if (e < currentWeekStart || s > weekEnd) return false;
+        return isSameDay(lastVisible, day);
+      });
 
-      td.innerHTML = '<span class="add-hint">+</span>';
+      if (rentalsStartingHere.length && rentalsEndingHere.length) {
+        td.innerHTML = '';
+      } else if (rentalsEndingHere.length) {
+        td.innerHTML = '<span class="add-hint add-hint-right">+</span>';
+      } else if (rentalsStartingHere.length) {
+        td.innerHTML = '<span class="add-hint add-hint-left">+</span>';
+      } else {
+        td.innerHTML = '<span class="add-hint">+</span>';
+      }
 
       for (const r of rentalsStartingHere) {
         td.appendChild(buildPostit(r, day, weekEnd));
@@ -288,9 +317,13 @@ function renderBody() {
 function buildPostit(rental, dayStart, weekEnd) {
   const s = parseISODate(rental.start_date);
   const e = parseISODate(rental.end_date);
+  const effectiveEnd = rentalEffectiveEndDate(rental);
   const firstVisible = s < currentWeekStart ? currentWeekStart : s;
-  const lastVisible = e > weekEnd ? weekEnd : e;
-  const span = Math.min(7, daysBetween(firstVisible, lastVisible) + 1);
+  const lastVisible = effectiveEnd > weekEnd ? weekEnd : effectiveEnd;
+  const visibleDays = daysBetween(firstVisible, lastVisible) + 1;
+  const leftOffset = s < currentWeekStart ? 0 : 0.5;
+  const rightOffset = effectiveEnd > weekEnd ? 0 : 0.5;
+  const span = Math.max(0.5, visibleDays - leftOffset - rightOffset);
 
   const el = document.createElement('div');
   el.className = 'postit ' + (rental.color || 'yellow');
@@ -299,12 +332,12 @@ function buildPostit(rental, dayStart, weekEnd) {
   if (!rental.returned_at && e < today) el.classList.add('late');
   if (rental.returned_at) el.classList.add('returned');
 
-  el.style.left = '4px';
+  el.style.left = `calc(${leftOffset * 100}% + 4px)`;
   el.style.width = `calc(${span * 100}% - 8px)`;
 
   const startFmt = fmtDateShort(s);
-  const endFmt = fmtDateShort(e);
-  const nbDays = daysBetween(s, e) + 1;
+  const endFmt = fmtDateShort(effectiveEnd);
+  const nbDays = daysBetween(s, effectiveEnd) + 1;
 
   el.innerHTML = `
     <span class="client-name">${escapeHtml(rental.client)}</span>
@@ -495,6 +528,48 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
   setTimeout(() => document.getElementById('rentalClient').focus(), 50);
 }
 
+function openReturnDateDialog({ defaultDate = toISODate(new Date()) } = {}) {
+  return new Promise(resolve => {
+    const modal = document.getElementById('returnModal');
+    const dateInput = document.getElementById('returnDateInput');
+    const okBtn = document.getElementById('returnOk');
+    const cancelBtn = document.getElementById('returnCancel');
+
+    dateInput.value = defaultDate;
+
+    const cleanup = () => {
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      modal.hidden = true;
+    };
+    const onOk = () => {
+      const selected = dateInput.value;
+      if (!selected) return;
+      cleanup();
+      resolve(selected);
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(null);
+    };
+    const onBackdrop = (e) => { if (e.target === modal) onCancel(); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') onCancel();
+      if (e.key === 'Enter' && document.activeElement === dateInput) onOk();
+    };
+
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey);
+
+    modal.hidden = false;
+    setTimeout(() => dateInput.focus(), 50);
+  });
+}
+
 function snapshotPostit() {
   return JSON.stringify({
     client: document.getElementById('rentalClient').value,
@@ -646,7 +721,17 @@ document.getElementById('returnRentalBtn').addEventListener('click', async () =>
   btn.disabled = true;
   try {
     if (action === 'return') {
-      await apiFetch('/api/rentals/' + id + '/return', { method: 'POST' });
+      const returnedAt = await openReturnDateDialog({ defaultDate: toISODate(new Date()) });
+      if (!returnedAt) return;
+      const startDate = document.getElementById('rentalStart').value;
+      if (startDate && returnedAt < startDate) {
+        toast('La date de retour ne peut pas être avant la date de début.', 'error');
+        return;
+      }
+      await apiFetch('/api/rentals/' + id + '/return', {
+        method: 'POST',
+        body: JSON.stringify({ returned_at: returnedAt })
+      });
       toast('Marqué comme retourné ✓', 'success');
     } else {
       await apiFetch('/api/rentals/' + id + '/unreturn', { method: 'POST' });
