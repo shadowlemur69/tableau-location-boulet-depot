@@ -567,6 +567,19 @@ main {
   font-style: italic;
 }
 
+.postit-picked-badge {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 9px;
+  font-weight: 800;
+  color: white;
+  background: #1f6b2d;
+  padding: 2px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.06em;
+}
+
 .postit.late {
   box-shadow: 0 0 0 2px var(--danger), 0 3px 6px rgba(197,48,48,0.25);
 }
@@ -745,6 +758,14 @@ main {
   margin-bottom: 14px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.label-meta {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  text-transform: none;
+  letter-spacing: 0;
 }
 .modal-card form input,
 .modal-card form select,

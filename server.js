@@ -73,6 +73,8 @@ db.exec(`
     equipment_id TEXT NOT NULL,
     equipment_name_snapshot TEXT,
     created_by TEXT,
+    picked_up_at INTEGER,
+    picked_up_by TEXT,
     client TEXT NOT NULL,
     phone TEXT,
     start_date TEXT NOT NULL,
@@ -125,6 +127,8 @@ ensureColumn('rentals', 'created_by', 'created_by TEXT');
 ensureColumn('rentals', 'updated_at', 'updated_at INTEGER NOT NULL DEFAULT 0');
 ensureColumn('rentals', 'version', 'version INTEGER NOT NULL DEFAULT 1');
 ensureColumn('rentals', 'returned_by', 'returned_by TEXT');
+ensureColumn('rentals', 'picked_up_at', 'picked_up_at INTEGER');
+ensureColumn('rentals', 'picked_up_by', 'picked_up_by TEXT');
 
 // ---------- HELPERS ----------
 function uid() { return crypto.randomBytes(8).toString('hex'); }
@@ -153,6 +157,11 @@ function normalizeReturnedAt(value) {
 function isoDateToTimestamp(dateStr) {
   const [y, m, d] = dateStr.split('-').map(Number);
   return new Date(y, m - 1, d).getTime();
+}
+function timestampStartOfDay(ts) {
+  const dt = new Date(ts);
+  dt.setHours(0, 0, 0, 0);
+  return dt.getTime();
 }
 
 // ---------- MIDDLEWARE ----------
@@ -785,6 +794,8 @@ app.post('/api/rentals', requirePermission('create_rental'), (req, res) => {
     equipment_id,
     equipment_name_snapshot: eq.name,
     created_by: req.auth?.username || AUTH_USER || 'system',
+    picked_up_at: null,
+    picked_up_by: null,
     client: clean.client,
     phone: clean.phone,
     start_date: clean.start_date,
@@ -798,8 +809,8 @@ app.post('/api/rentals', requirePermission('create_rental'), (req, res) => {
     version: 1
   };
   db.prepare(`INSERT INTO rentals
-    (id, equipment_id, equipment_name_snapshot, created_by, client, phone, start_date, end_date, note, color, returned_at, returned_by, created_at, updated_at, version)
-    VALUES (@id, @equipment_id, @equipment_name_snapshot, @created_by, @client, @phone, @start_date, @end_date, @note, @color, @returned_at, @returned_by, @created_at, @updated_at, @version)`
+    (id, equipment_id, equipment_name_snapshot, created_by, picked_up_at, picked_up_by, client, phone, start_date, end_date, note, color, returned_at, returned_by, created_at, updated_at, version)
+    VALUES (@id, @equipment_id, @equipment_name_snapshot, @created_by, @picked_up_at, @picked_up_by, @client, @phone, @start_date, @end_date, @note, @color, @returned_at, @returned_by, @created_at, @updated_at, @version)`
   ).run(row);
   broadcast('rentals:changed', { action: 'created', item: row });
   res.json(row);
@@ -853,14 +864,55 @@ app.put('/api/rentals/:id', requirePermission('create_rental'), (req, res) => {
   res.json(updated);
 });
 
+app.post('/api/rentals/:id/pickup', requirePermission('confirm_return'), (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
+  if (existing.returned_at) {
+    return res.status(409).json({ error: 'Cette location est déjà retournée.' });
+  }
+  if (existing.picked_up_at) return res.json(existing); // idempotent
+
+  const pickedUpAt = normalizeReturnedAt(req.body?.picked_up_at);
+  if (pickedUpAt === null) return res.status(400).json({ error: 'Date de récupération invalide.' });
+
+  const ts = now();
+  const pickedUpBy = req.auth?.username || AUTH_USER || 'system';
+  db.prepare('UPDATE rentals SET picked_up_at = ?, picked_up_by = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+    .run(pickedUpAt, pickedUpBy, ts, id);
+  const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
+  broadcast('rentals:changed', { action: 'updated', item: updated });
+  res.json(updated);
+});
+
+app.post('/api/rentals/:id/unpickup', requirePermission('confirm_return'), (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
+  if (existing.returned_at) {
+    return res.status(409).json({ error: 'Impossible d\'annuler Loué après un retour. Annulez d\'abord le retour.' });
+  }
+  if (!existing.picked_up_at) return res.json(existing); // idempotent
+
+  const ts = now();
+  db.prepare('UPDATE rentals SET picked_up_at = NULL, picked_up_by = NULL, updated_at = ?, version = version + 1 WHERE id = ?')
+    .run(ts, id);
+  const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
+  broadcast('rentals:changed', { action: 'updated', item: updated });
+  res.json(updated);
+});
+
 app.post('/api/rentals/:id/return', requirePermission('confirm_return'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
+  if (!existing.picked_up_at) {
+    return res.status(409).json({ error: 'Cette location doit d\'abord être marquée Loué.' });
+  }
   if (existing.returned_at) return res.json(existing); // idempotent
   const returnedAt = normalizeReturnedAt(req.body?.returned_at);
   if (returnedAt === null) return res.status(400).json({ error: 'Date de retour invalide.' });
-  if (returnedAt < isoDateToTimestamp(existing.start_date)) {
+  if (returnedAt < timestampStartOfDay(existing.picked_up_at)) {
     return res.status(400).json({ error: 'La date de retour ne peut pas être avant la date de début.' });
   }
   const ts = now();
@@ -887,6 +939,9 @@ app.delete('/api/rentals/:id', requirePermission('create_rental'), (req, res) =>
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
+  if (existing.picked_up_at || existing.returned_at) {
+    return res.status(409).json({ error: 'Impossible de supprimer une location marquée Loué ou Retournée.' });
+  }
   db.prepare('DELETE FROM rentals WHERE id = ?').run(id);
   broadcast('rentals:changed', { action: 'deleted', id });
   res.json({ ok: true });

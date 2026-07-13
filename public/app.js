@@ -110,6 +110,24 @@ function rentalEffectiveEndDate(rental) {
   if (!rental.returned_at) return plannedEnd;
   return startOfDay(new Date(rental.returned_at));
 }
+function rentalEffectiveStartDate(rental) {
+  const pickedUp = rentalPickupDate(rental);
+  if (pickedUp) return pickedUp;
+  return parseISODate(rental.start_date);
+}
+function rentalPickupDate(rental) {
+  if (!rental?.picked_up_at) return null;
+  return startOfDay(new Date(rental.picked_up_at));
+}
+function rentalStatus(rental, today = startOfDay(new Date())) {
+  if (rental.returned_at) return 'returned';
+  const plannedStart = parseISODate(rental.start_date);
+  const plannedEnd = parseISODate(rental.end_date);
+  const pickedUp = rentalPickupDate(rental);
+  if (!pickedUp && plannedStart && plannedStart < today) return 'late';
+  if (pickedUp && plannedEnd && plannedEnd < today) return 'late';
+  return 'active';
+}
 function fmtDateShort(date) {
   return date.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short' });
 }
@@ -248,14 +266,8 @@ function renderStats() {
   const today = new Date(); today.setHours(0,0,0,0);
   const weekEnd = addDays(currentWeekStart, 6);
 
-  const active = rentals.filter(r => {
-    const effectiveEnd = rentalEffectiveEndDate(r);
-    return !r.returned_at && effectiveEnd && effectiveEnd >= today;
-  }).length;
-  const late = rentals.filter(r => {
-    const effectiveEnd = rentalEffectiveEndDate(r);
-    return !r.returned_at && effectiveEnd && effectiveEnd < today;
-  }).length;
+  const active = rentals.filter(r => rentalStatus(r, today) === 'active').length;
+  const late = rentals.filter(r => rentalStatus(r, today) === 'late').length;
   const thisWeek = rentals.filter(r => {
     const s = parseISODate(r.start_date);
     const e = rentalEffectiveEndDate(r);
@@ -340,7 +352,7 @@ function renderBody() {
 
       const rentalsStartingHere = rentals.filter(r => {
         if (r.equipment_id !== eq.id) return false;
-        const s = parseISODate(r.start_date);
+        const s = rentalEffectiveStartDate(r);
         const e = rentalEffectiveEndDate(r);
         if (!s || !e) return false;
         const firstVisible = s < currentWeekStart ? currentWeekStart : s;
@@ -349,7 +361,7 @@ function renderBody() {
       });
       const rentalsEndingHere = rentals.filter(r => {
         if (r.equipment_id !== eq.id) return false;
-        const s = parseISODate(r.start_date);
+        const s = rentalEffectiveStartDate(r);
         const e = rentalEffectiveEndDate(r);
         if (!s || !e) return false;
         const lastVisible = e > weekEnd ? weekEnd : e;
@@ -387,7 +399,7 @@ function renderBody() {
 }
 
 function buildPostit(rental, dayStart, weekEnd) {
-  const s = parseISODate(rental.start_date);
+  const s = rentalEffectiveStartDate(rental);
   const e = parseISODate(rental.end_date);
   const effectiveEnd = rentalEffectiveEndDate(rental);
   const firstVisible = s < currentWeekStart ? currentWeekStart : s;
@@ -401,7 +413,7 @@ function buildPostit(rental, dayStart, weekEnd) {
   el.className = 'postit ' + (rental.color || 'yellow');
 
   const today = new Date(); today.setHours(0,0,0,0);
-  if (!rental.returned_at && e < today) el.classList.add('late');
+  if (rentalStatus(rental, today) === 'late') el.classList.add('late');
   if (rental.returned_at) el.classList.add('returned');
 
   el.style.left = `calc(${leftOffset * 100}% + 4px)`;
@@ -410,8 +422,12 @@ function buildPostit(rental, dayStart, weekEnd) {
   const startFmt = fmtDateShort(s);
   const endFmt = fmtDateShort(effectiveEnd);
   const nbDays = daysBetween(s, effectiveEnd) + 1;
+  const pickedBadge = rental.picked_up_at && !rental.returned_at
+    ? '<span class="postit-picked-badge">LOUÉ</span>'
+    : '';
 
   el.innerHTML = `
+    ${pickedBadge}
     <span class="client-name">${escapeHtml(rental.client)}</span>
     <span class="dates">${startFmt} → ${endFmt} · ${nbDays}j</span>
     ${rental.note ? `<span class="note-preview">${escapeHtml(rental.note)}</span>` : ''}
@@ -553,6 +569,40 @@ let postitModalDirty = false;
 let postitModalOriginal = null;
 let postitCurrentRental = null;
 
+function updateRentalDateLabels(rental) {
+  const startLabel = document.getElementById('rentalStartLabel');
+  const endLabel = document.getElementById('rentalEndLabel');
+  const startMeta = document.getElementById('rentalStartMeta');
+  const endMeta = document.getElementById('rentalEndMeta');
+
+  startMeta.textContent = '';
+  endMeta.textContent = '';
+
+  if (!rental) {
+    startLabel.textContent = 'Date de début prévue';
+    endLabel.textContent = 'Date de retour prévue';
+    return;
+  }
+
+  const pickedUpAt = rentalPickupDate(rental);
+  const returnedAt = rental.returned_at ? startOfDay(new Date(rental.returned_at)) : null;
+
+  if (!pickedUpAt) {
+    startLabel.textContent = 'Date de début prévue';
+    endLabel.textContent = 'Date de retour prévue';
+    return;
+  }
+
+  startLabel.textContent = 'Date de début';
+
+  if (!returnedAt) {
+    endLabel.textContent = 'Date de retour prévue';
+    return;
+  }
+
+  endLabel.textContent = 'Date de retour';
+}
+
 function openPostitModal(rental = null, equipmentId = null, defaultDate = null) {
   const modal = document.getElementById('postitModal');
   const eqId = rental ? rental.equipment_id : equipmentId;
@@ -578,17 +628,39 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
 
   document.getElementById('rentalClient').value = rental?.client || '';
   document.getElementById('rentalPhone').value = rental?.phone || '';
-  document.getElementById('rentalStart').value = rental?.start_date || defaultDate || toISODate(new Date());
-  document.getElementById('rentalEnd').value = rental?.end_date || defaultDate || toISODate(new Date());
+  const displayStart = rental?.picked_up_at
+    ? toISODate(startOfDay(new Date(rental.picked_up_at)))
+    : (rental?.start_date || defaultDate || toISODate(new Date()));
+  const displayEnd = rental?.returned_at
+    ? toISODate(startOfDay(new Date(rental.returned_at)))
+    : (rental?.end_date || defaultDate || toISODate(new Date()));
+  document.getElementById('rentalStart').value = displayStart;
+  document.getElementById('rentalEnd').value = displayEnd;
   document.getElementById('rentalNote').value = rental?.note || '';
   document.getElementById('rentalColor').value = rental?.color || 'yellow';
+  updateRentalDateLabels(rental);
 
-  document.getElementById('deleteRentalBtn').hidden = !rental;
-  if (!hasPermission('create_rental')) {
-    document.getElementById('deleteRentalBtn').hidden = true;
-  }
+  const deleteBtn = document.getElementById('deleteRentalBtn');
+  deleteBtn.hidden = !rental || !hasPermission('create_rental') || !!rental?.picked_up_at || !!rental?.returned_at;
+
+  const pickupBtn = document.getElementById('pickupRentalBtn');
   const returnBtn = document.getElementById('returnRentalBtn');
-  if (rental?.returned_at) {
+
+  if (!rental) {
+    pickupBtn.hidden = true;
+    returnBtn.hidden = true;
+  } else if (!rental.picked_up_at) {
+    if (hasPermission('confirm_return')) {
+      pickupBtn.hidden = false;
+      pickupBtn.textContent = '✓ Loué';
+      pickupBtn.dataset.action = 'pickup';
+      returnBtn.hidden = true;
+    } else {
+      pickupBtn.hidden = true;
+      returnBtn.hidden = true;
+    }
+  } else if (rental.returned_at) {
+    pickupBtn.hidden = true;
     if (hasPermission('undo_return')) {
       returnBtn.hidden = false;
       returnBtn.textContent = '↺ Annuler le retour';
@@ -596,7 +668,14 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
     } else {
       returnBtn.hidden = true;
     }
-  } else if (rental) {
+  } else {
+    if (hasPermission('confirm_return')) {
+      pickupBtn.hidden = false;
+      pickupBtn.textContent = '↺ Annuler Loué';
+      pickupBtn.dataset.action = 'unpickup';
+    } else {
+      pickupBtn.hidden = true;
+    }
     if (hasPermission('confirm_return')) {
       returnBtn.hidden = false;
       returnBtn.textContent = '✓ Marquer retourné';
@@ -604,8 +683,6 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
     } else {
       returnBtn.hidden = true;
     }
-  } else {
-    returnBtn.hidden = true;
   }
 
   // Bloquer la création si l'équipement est archivé
@@ -628,13 +705,28 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
   setTimeout(() => document.getElementById('rentalClient').focus(), 50);
 }
 
-function openReturnDateDialog({ defaultDate = toISODate(new Date()) } = {}) {
+function openReturnDateDialog({
+  defaultDate = toISODate(new Date()),
+  title = 'Confirmer la date de retour',
+  body = 'Choisissez la date effective de retour.',
+  label = 'Date de retour',
+  minDate = MIN_DATE,
+  maxDate = MAX_DATE
+} = {}) {
   return new Promise(resolve => {
     const modal = document.getElementById('returnModal');
     const dateInput = document.getElementById('returnDateInput');
+    const titleEl = document.getElementById('returnTitle');
+    const bodyEl = document.getElementById('returnBody');
+    const labelEl = document.getElementById('returnDateLabel');
     const okBtn = document.getElementById('returnOk');
     const cancelBtn = document.getElementById('returnCancel');
 
+    titleEl.textContent = title;
+    bodyEl.textContent = body;
+    labelEl.textContent = label;
+    dateInput.min = minDate;
+    dateInput.max = maxDate;
     dateInput.value = defaultDate;
 
     const cleanup = () => {
@@ -794,6 +886,10 @@ document.getElementById('deleteRentalBtn').addEventListener('click', async () =>
   const id = document.getElementById('rentalId').value;
   if (!id) return;
   const rental = rentals.find(r => r.id === id);
+  if (rental?.picked_up_at || rental?.returned_at) {
+    toast('Une location marquée Loué ou Retournée ne peut pas être supprimée.', 'error');
+    return;
+  }
   const ok = await confirmDialog({
     title: 'Supprimer cette location ?',
     body: `${rental?.client ? `Location de ${rental.client}. ` : ''}Elle disparaîtra aussi de l'historique. Pour conserver la trace, marquez-la plutôt "retournée".`,
@@ -814,6 +910,43 @@ document.getElementById('deleteRentalBtn').addEventListener('click', async () =>
   }
 });
 
+document.getElementById('pickupRentalBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('pickupRentalBtn');
+  if (btn.disabled) return;
+  const id = document.getElementById('rentalId').value;
+  if (!id) return;
+  if (!hasPermission('confirm_return')) return toast('Permission insuffisante.', 'error');
+  const action = btn.dataset.action || 'pickup';
+  btn.disabled = true;
+  try {
+    if (action === 'pickup') {
+      const pickedUpAt = await openReturnDateDialog({
+        defaultDate: toISODate(new Date()),
+        title: 'Confirmer la date de récupération',
+        body: 'Choisissez la date réelle où le client a récupéré l\'équipement.',
+        label: 'Date de récupération',
+        minDate: MIN_DATE,
+        maxDate: MAX_DATE
+      });
+      if (!pickedUpAt) return;
+      await apiFetch('/api/rentals/' + id + '/pickup', {
+        method: 'POST',
+        body: JSON.stringify({ picked_up_at: pickedUpAt })
+      });
+      toast('Location marquée Loué ✓', 'success');
+    } else {
+      await apiFetch('/api/rentals/' + id + '/unpickup', { method: 'POST' });
+      toast('État Loué annulé', 'success');
+    }
+    postitModalDirty = false;
+    closeModal('postitModal');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById('returnRentalBtn').addEventListener('click', async () => {
   const btn = document.getElementById('returnRentalBtn');
   if (btn.disabled) return;
@@ -825,9 +958,17 @@ document.getElementById('returnRentalBtn').addEventListener('click', async () =>
   btn.disabled = true;
   try {
     if (action === 'return') {
-      const returnedAt = await openReturnDateDialog({ defaultDate: toISODate(new Date()) });
+      const rental = rentals.find((r) => r.id === id);
+      const pickupDate = rental?.picked_up_at ? toISODate(startOfDay(new Date(rental.picked_up_at))) : '';
+      const minReturnDate = pickupDate || document.getElementById('rentalStart').value || MIN_DATE;
+      const defaultReturnDate = toISODate(new Date()) < minReturnDate ? minReturnDate : toISODate(new Date());
+      const returnedAt = await openReturnDateDialog({
+        defaultDate: defaultReturnDate,
+        minDate: minReturnDate,
+        maxDate: MAX_DATE
+      });
       if (!returnedAt) return;
-      const startDate = document.getElementById('rentalStart').value;
+      const startDate = pickupDate || document.getElementById('rentalStart').value;
       if (startDate && returnedAt < startDate) {
         toast('La date de retour ne peut pas être avant la date de début.', 'error');
         return;
@@ -1103,10 +1244,7 @@ function renderHistory() {
     const eq = equipmentAll.find(x => x.id === r.equipment_id);
     const eqName = eq ? eq.name : (r.equipment_name_snapshot || '(équipement supprimé)');
     const eqArchived = !!eq?.archived_at;
-    const e = rentalEffectiveEndDate(r);
-    let status = 'active';
-    if (r.returned_at) status = 'returned';
-    else if (e && e < today) status = 'late';
+    const status = rentalStatus(r, today);
     return { ...r, eqName, eqArchived, status };
   });
 
@@ -1124,14 +1262,8 @@ function renderHistory() {
 
   const stats = {
     total: rentals.length,
-    active: rentals.filter(r => {
-      const effectiveEnd = rentalEffectiveEndDate(r);
-      return !r.returned_at && effectiveEnd && effectiveEnd >= today;
-    }).length,
-    late: rentals.filter(r => {
-      const effectiveEnd = rentalEffectiveEndDate(r);
-      return !r.returned_at && effectiveEnd && effectiveEnd < today;
-    }).length,
+    active: rentals.filter(r => rentalStatus(r, today) === 'active').length,
+    late: rentals.filter(r => rentalStatus(r, today) === 'late').length,
     returned: rentals.filter(r => r.returned_at).length,
     archivedEq: equipmentAll.filter(e => e.archived_at).length
   };

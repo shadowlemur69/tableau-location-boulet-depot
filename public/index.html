@@ -213,10 +213,10 @@
       </label>
 
       <div class="grid-2">
-        <label>Date de début
+        <label><span id="rentalStartLabel">Date de début</span><span class="label-meta" id="rentalStartMeta"></span>
           <input type="date" id="rentalStart" required min="2000-01-01" max="2099-12-31" />
         </label>
-        <label>Date de retour prévue
+        <label><span id="rentalEndLabel">Date de retour prévue</span><span class="label-meta" id="rentalEndMeta"></span>
           <input type="date" id="rentalEnd" required min="2000-01-01" max="2099-12-31" />
         </label>
       </div>
@@ -245,6 +245,10 @@
         <button type="button" class="btn btn-danger" id="deleteRentalBtn" hidden>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg>
           Supprimer
+        </button>
+        <button type="button" class="btn btn-success" id="pickupRentalBtn" hidden>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          Loué
         </button>
         <button type="button" class="btn btn-success" id="returnRentalBtn" hidden>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -343,7 +347,7 @@
     </div>
     <div class="confirm-body">
       <p id="returnBody">Choisissez la date effective de retour.</p>
-      <label class="return-date-field">Date de retour
+      <label class="return-date-field"><span id="returnDateLabel">Date de retour</span>
         <input type="date" id="returnDateInput" required min="2000-01-01" max="2099-12-31" />
       </label>
     </div>
