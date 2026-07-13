@@ -12,11 +12,66 @@ let equipment = [];             // équipements actifs (non archivés)
 let equipmentAll = [];          // + archivés (pour l'historique)
 let rentals = [];
 let currentWeekStart = getMonday(new Date());
+let currentSession = null;
+let authGroups = [];
+let authUsers = [];
+let historyFilteredList = [];
+let historyRenderedCount = 0;
 
 // Champs & limites (miroir du serveur)
 const LIMITS = { name: 120, category: 80, code: 40, client: 120, phone: 40, note: 500 };
 const MIN_DATE = '2000-01-01';
 const MAX_DATE = '2099-12-31';
+const HISTORY_PAGE_SIZE = 50;
+const PERM_KEYS = ['admin', 'create_rental', 'create_equipment', 'undo_return', 'confirm_return'];
+
+function allPermissionsEnabled() {
+  return Object.fromEntries(PERM_KEYS.map((k) => [k, true]));
+}
+
+function hasPermission(permission) {
+  if (!currentSession) return false;
+  if (currentSession.is_admin) return true;
+  return !!currentSession.permissions?.[permission];
+}
+
+function applySessionToUI() {
+  const settingsBtn = document.getElementById('settingsBtn');
+  const addRowBtn = document.getElementById('addRowBtn');
+  if (settingsBtn) settingsBtn.hidden = !currentSession?.is_admin;
+  if (addRowBtn) addRowBtn.hidden = !hasPermission('create_equipment');
+}
+
+async function loadSession() {
+  try {
+    const res = await fetch(API + '/api/auth/session', { credentials: 'same-origin' });
+    if (res.status === 401) {
+      window.location.href = '/login.html';
+      return;
+    }
+    const body = await res.json();
+    if (body.auth === false) {
+      currentSession = {
+        username: body.user || 'open-mode',
+        full_name: body.user || 'Open Mode',
+        is_admin: true,
+        permissions: allPermissionsEnabled()
+      };
+    } else {
+      currentSession = {
+        username: body.user,
+        full_name: body.full_name,
+        group_name: body.group_name,
+        group_full_name: body.group_full_name,
+        is_admin: !!body.is_admin,
+        permissions: body.permissions || {}
+      };
+    }
+    applySessionToUI();
+  } catch (_) {
+    window.location.href = '/login.html';
+  }
+}
 
 // ---------- UTILITAIRES DATE ----------
 function getMonday(date) {
@@ -53,8 +108,7 @@ function rentalEffectiveEndDate(rental) {
   const plannedEnd = parseISODate(rental.end_date);
   if (!plannedEnd) return null;
   if (!rental.returned_at) return plannedEnd;
-  const returnedDay = startOfDay(new Date(rental.returned_at));
-  return returnedDay < plannedEnd ? returnedDay : plannedEnd;
+  return startOfDay(new Date(rental.returned_at));
 }
 function fmtDateShort(date) {
   return date.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short' });
@@ -194,11 +248,17 @@ function renderStats() {
   const today = new Date(); today.setHours(0,0,0,0);
   const weekEnd = addDays(currentWeekStart, 6);
 
-  const active = rentals.filter(r => !r.returned_at && parseISODate(r.end_date) >= today).length;
-  const late = rentals.filter(r => !r.returned_at && parseISODate(r.end_date) < today).length;
+  const active = rentals.filter(r => {
+    const effectiveEnd = rentalEffectiveEndDate(r);
+    return !r.returned_at && effectiveEnd && effectiveEnd >= today;
+  }).length;
+  const late = rentals.filter(r => {
+    const effectiveEnd = rentalEffectiveEndDate(r);
+    return !r.returned_at && effectiveEnd && effectiveEnd < today;
+  }).length;
   const thisWeek = rentals.filter(r => {
     const s = parseISODate(r.start_date);
-    const e = parseISODate(r.end_date);
+    const e = rentalEffectiveEndDate(r);
     if (!s || !e) return false;
     return !(e < currentWeekStart || s > weekEnd);
   }).length;
@@ -249,7 +309,9 @@ function renderBody() {
     const tr = document.createElement('tr');
     const equipTd = document.createElement('td');
     equipTd.className = 'equip-cell';
-    equipTd.title = 'Cliquer pour modifier l\'équipement';
+    equipTd.title = hasPermission('create_equipment')
+      ? 'Cliquer pour modifier l\'équipement'
+      : 'Vous n\'avez pas la permission de modifier les équipements';
     let metaHtml = '';
     if (eq.category || eq.code) {
       const parts = [];
@@ -261,7 +323,13 @@ function renderBody() {
       <div class="equip-name">${escapeHtml(eq.name)}</div>
       ${metaHtml}
     `;
-    equipTd.addEventListener('click', () => openRowModal(eq));
+    equipTd.addEventListener('click', () => {
+      if (!hasPermission('create_equipment')) {
+        toast('Vous n\'avez pas la permission de modifier les équipements.', 'error');
+        return;
+      }
+      openRowModal(eq);
+    });
     tr.appendChild(equipTd);
 
     for (let i = 0; i < 7; i++) {
@@ -305,6 +373,10 @@ function renderBody() {
 
       td.addEventListener('click', (e) => {
         if (e.target.closest('.postit')) return;
+        if (!hasPermission('create_rental')) {
+          toast('Vous n\'avez pas la permission de créer des locations.', 'error');
+          return;
+        }
         openPostitModal(null, eq.id, toISODate(day));
       });
 
@@ -358,6 +430,10 @@ let rowModalDirty = false;
 let rowModalOriginal = null;
 
 function openRowModal(eq = null) {
+  if (!hasPermission('create_equipment')) {
+    toast('Vous n\'avez pas la permission de gérer les équipements.', 'error');
+    return;
+  }
   const modal = document.getElementById('rowModal');
   document.getElementById('rowTitle').textContent = eq ? 'Modifier l\'équipement' : 'Nouvel équipement';
   document.getElementById('rowId').value = eq?.id || '';
@@ -395,6 +471,7 @@ function openRowModal(eq = null) {
 
 document.getElementById('rowForm').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (!hasPermission('create_equipment')) return toast('Permission insuffisante.', 'error');
   const submitBtn = e.target.querySelector('button[type="submit"]');
   if (submitBtn.disabled) return;
   submitBtn.disabled = true;
@@ -434,6 +511,7 @@ document.getElementById('rowForm').addEventListener('submit', async (e) => {
 });
 
 document.getElementById('deleteRowBtn').addEventListener('click', async () => {
+  if (!hasPermission('create_equipment')) return toast('Permission insuffisante.', 'error');
   const id = document.getElementById('rowId').value;
   if (!id) return;
   const eq = equipment.find(x => x.id === id);
@@ -489,6 +567,14 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
   let equipInfo = eq ? `📦 ${eq.name}${eq.code ? ' · ' + eq.code : ''}` : '(équipement supprimé)';
   if (eq?.archived_at) equipInfo += ' · Archivé';
   document.getElementById('postitEquipInfo').textContent = equipInfo;
+  const returnInfo = document.getElementById('returnConfirmedInfo');
+  if (rental?.returned_at) {
+    returnInfo.hidden = false;
+    returnInfo.textContent = `Date de retour confirmée : ${new Date(rental.returned_at).toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}`;
+  } else {
+    returnInfo.hidden = true;
+    returnInfo.textContent = '';
+  }
 
   document.getElementById('rentalClient').value = rental?.client || '';
   document.getElementById('rentalPhone').value = rental?.phone || '';
@@ -498,22 +584,36 @@ function openPostitModal(rental = null, equipmentId = null, defaultDate = null) 
   document.getElementById('rentalColor').value = rental?.color || 'yellow';
 
   document.getElementById('deleteRentalBtn').hidden = !rental;
+  if (!hasPermission('create_rental')) {
+    document.getElementById('deleteRentalBtn').hidden = true;
+  }
   const returnBtn = document.getElementById('returnRentalBtn');
   if (rental?.returned_at) {
-    returnBtn.hidden = false;
-    returnBtn.textContent = '↺ Annuler le retour';
-    returnBtn.dataset.action = 'unreturn';
+    if (hasPermission('undo_return')) {
+      returnBtn.hidden = false;
+      returnBtn.textContent = '↺ Annuler le retour';
+      returnBtn.dataset.action = 'unreturn';
+    } else {
+      returnBtn.hidden = true;
+    }
   } else if (rental) {
-    returnBtn.hidden = false;
-    returnBtn.textContent = '✓ Marquer retourné';
-    returnBtn.dataset.action = 'return';
+    if (hasPermission('confirm_return')) {
+      returnBtn.hidden = false;
+      returnBtn.textContent = '✓ Marquer retourné';
+      returnBtn.dataset.action = 'return';
+    } else {
+      returnBtn.hidden = true;
+    }
   } else {
     returnBtn.hidden = true;
   }
 
   // Bloquer la création si l'équipement est archivé
   const submitBtn = document.getElementById('postitSubmit');
-  if (!rental && eq?.archived_at) {
+  if (!hasPermission('create_rental')) {
+    submitBtn.disabled = true;
+    submitBtn.title = 'Permission insuffisante.';
+  } else if (!rental && eq?.archived_at) {
     submitBtn.disabled = true;
     submitBtn.title = 'Équipement archivé : restaurez-le d\'abord.';
   } else {
@@ -599,6 +699,7 @@ document.getElementById('rentalStart').addEventListener('change', () => {
 
 document.getElementById('postitForm').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (!hasPermission('create_rental')) return toast('Permission insuffisante.', 'error');
   const submitBtn = document.getElementById('postitSubmit');
   if (submitBtn.disabled) return;
 
@@ -687,6 +788,7 @@ async function submitRental(id, payload, force = false) {
 }
 
 document.getElementById('deleteRentalBtn').addEventListener('click', async () => {
+  if (!hasPermission('create_rental')) return toast('Permission insuffisante.', 'error');
   const btn = document.getElementById('deleteRentalBtn');
   if (btn.disabled) return;
   const id = document.getElementById('rentalId').value;
@@ -718,6 +820,8 @@ document.getElementById('returnRentalBtn').addEventListener('click', async () =>
   const id = document.getElementById('rentalId').value;
   if (!id) return;
   const action = btn.dataset.action;
+  if (action === 'return' && !hasPermission('confirm_return')) return toast('Permission insuffisante.', 'error');
+  if (action === 'unreturn' && !hasPermission('undo_return')) return toast('Permission insuffisante.', 'error');
   btn.disabled = true;
   try {
     if (action === 'return') {
@@ -749,10 +853,218 @@ document.getElementById('returnRentalBtn').addEventListener('click', async () =>
 // =========================================================
 // HISTORIQUE
 // =========================================================
-document.getElementById('historyBtn').addEventListener('click', () => {
+function openHistoryModalWithFilter(filter = 'all') {
+  const filterSelect = document.getElementById('historyFilter');
+  const searchInput = document.getElementById('historySearch');
+  filterSelect.value = filter;
+  searchInput.value = '';
   document.getElementById('historyModal').hidden = false;
   renderHistory();
+}
+
+document.getElementById('historyBtn').addEventListener('click', () => {
+  openHistoryModalWithFilter('all');
 });
+
+document.querySelectorAll('.stat-card[data-history-filter]').forEach(card => {
+  card.addEventListener('click', () => {
+    openHistoryModalWithFilter(card.dataset.historyFilter || 'all');
+  });
+  card.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    openHistoryModalWithFilter(card.dataset.historyFilter || 'all');
+  });
+});
+
+function renderGroupsList() {
+  const el = document.getElementById('groupsList');
+  if (!authGroups.length) {
+    el.innerHTML = '<div class="history-empty">Aucun groupe</div>';
+    return;
+  }
+  el.innerHTML = authGroups.map((g) => {
+    const perms = Object.entries(g.permissions || {})
+      .filter(([, v]) => !!v)
+      .map(([k]) => `<span class="perm-chip">${escapeHtml(k)}</span>`)
+      .join('') || '<span class="perm-chip">aucune permission</span>';
+    return `
+      <div class="settings-item">
+        <div class="settings-item-title">${escapeHtml(g.full_name)} <span class="mini-badge">${escapeHtml(g.name)}</span></div>
+        <div class="settings-item-sub">${perms}</div>
+        <div class="settings-item-actions">
+          <button type="button" class="btn btn-outline btn-edit edit-group-btn" data-id="${escapeHtml(g.id)}">Modifier</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  el.querySelectorAll('.edit-group-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const g = authGroups.find((x) => x.id === btn.dataset.id);
+      if (!g) return;
+      document.getElementById('groupEditId').value = g.id;
+      document.getElementById('groupName').value = g.name;
+      document.getElementById('groupFullName').value = g.full_name;
+      document.getElementById('permAdmin').checked = !!g.permissions?.admin;
+      document.getElementById('permCreateRental').checked = !!g.permissions?.create_rental;
+      document.getElementById('permCreateEquipment').checked = !!g.permissions?.create_equipment;
+      document.getElementById('permUndoReturn').checked = !!g.permissions?.undo_return;
+      document.getElementById('permConfirmReturn').checked = !!g.permissions?.confirm_return;
+      document.getElementById('groupSubmitBtn').textContent = 'Enregistrer groupe';
+      document.getElementById('cancelGroupEdit').hidden = false;
+      document.getElementById('groupName').focus();
+    });
+  });
+}
+
+function renderUsersList() {
+  const el = document.getElementById('usersList');
+  if (!authUsers.length) {
+    el.innerHTML = '<div class="history-empty">Aucun utilisateur</div>';
+    return;
+  }
+  el.innerHTML = authUsers.map((u) => `
+    <div class="settings-item">
+      <div class="settings-item-title">${escapeHtml(u.full_name)} <span class="mini-badge">${escapeHtml(u.username)}</span></div>
+      <div class="settings-item-sub">Groupe: ${escapeHtml(u.group_full_name || u.group_name)}${u.active ? '' : ' · Inactif'}</div>
+      <div class="settings-item-actions">
+        <button type="button" class="btn btn-outline btn-edit edit-user-btn" data-id="${escapeHtml(u.id)}">Modifier</button>
+      </div>
+    </div>
+  `).join('');
+
+  el.querySelectorAll('.edit-user-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const u = authUsers.find((x) => x.id === btn.dataset.id);
+      if (!u) return;
+      document.getElementById('userEditId').value = u.id;
+      document.getElementById('newUsername').value = u.username;
+      document.getElementById('newFullName').value = u.full_name;
+      document.getElementById('newUserGroup').value = u.group_id;
+      document.getElementById('newPassword').value = '';
+      document.getElementById('newPassword').placeholder = 'Laisser vide pour conserver';
+      document.getElementById('newPassword').required = false;
+      document.getElementById('userSubmitBtn').textContent = 'Enregistrer utilisateur';
+      document.getElementById('cancelUserEdit').hidden = false;
+      document.getElementById('newUsername').focus();
+    });
+  });
+}
+
+function resetGroupFormMode() {
+  document.getElementById('groupForm').reset();
+  document.getElementById('groupEditId').value = '';
+  document.getElementById('groupSubmitBtn').textContent = 'Créer groupe';
+  document.getElementById('cancelGroupEdit').hidden = true;
+}
+
+function resetUserFormMode() {
+  document.getElementById('userForm').reset();
+  document.getElementById('userEditId').value = '';
+  document.getElementById('newPassword').placeholder = 'Minimum 8 caractères';
+  document.getElementById('newPassword').required = true;
+  document.getElementById('userSubmitBtn').textContent = 'Créer utilisateur';
+  document.getElementById('cancelUserEdit').hidden = true;
+}
+
+function renderUserGroupOptions() {
+  const select = document.getElementById('newUserGroup');
+  select.innerHTML = authGroups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.full_name)} (${escapeHtml(g.name)})</option>`).join('');
+}
+
+async function loadAdminSettingsData() {
+  const [groups, users] = await Promise.all([
+    apiFetch('/api/admin/groups'),
+    apiFetch('/api/admin/users')
+  ]);
+  authGroups = groups;
+  authUsers = users;
+  renderGroupsList();
+  renderUsersList();
+  renderUserGroupOptions();
+}
+
+document.getElementById('settingsBtn').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  if (!currentSession?.is_admin) return;
+  const settingsModal = document.getElementById('settingsModal');
+  setTimeout(() => {
+    settingsModal.hidden = false;
+    settingsModal.dataset.ignoreBackdropUntil = String(Date.now() + 250);
+  }, 0);
+  try {
+    await loadAdminSettingsData();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('permAdmin').addEventListener('change', (e) => {
+  const checked = e.target.checked;
+  ['permCreateRental', 'permCreateEquipment', 'permUndoReturn', 'permConfirmReturn'].forEach((id) => {
+    const cb = document.getElementById(id);
+    cb.checked = checked || cb.checked;
+  });
+});
+
+document.getElementById('groupForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const editId = document.getElementById('groupEditId').value;
+    const isEdit = !!editId;
+    await apiFetch(isEdit ? `/api/admin/groups/${editId}` : '/api/admin/groups', {
+      method: isEdit ? 'PUT' : 'POST',
+      body: JSON.stringify({
+        name: document.getElementById('groupName').value.trim(),
+        full_name: document.getElementById('groupFullName').value.trim(),
+        permissions: {
+          admin: document.getElementById('permAdmin').checked,
+          create_rental: document.getElementById('permCreateRental').checked,
+          create_equipment: document.getElementById('permCreateEquipment').checked,
+          undo_return: document.getElementById('permUndoReturn').checked,
+          confirm_return: document.getElementById('permConfirmReturn').checked
+        }
+      })
+    });
+    resetGroupFormMode();
+    await loadAdminSettingsData();
+    toast(isEdit ? 'Groupe modifié' : 'Groupe créé', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('userForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const editId = document.getElementById('userEditId').value;
+    const isEdit = !!editId;
+    await apiFetch(isEdit ? `/api/admin/users/${editId}` : '/api/admin/users', {
+      method: isEdit ? 'PUT' : 'POST',
+      body: JSON.stringify({
+        username: document.getElementById('newUsername').value.trim(),
+        password: document.getElementById('newPassword').value,
+        full_name: document.getElementById('newFullName').value.trim(),
+        group_id: document.getElementById('newUserGroup').value
+      })
+    });
+    resetUserFormMode();
+    await loadAdminSettingsData();
+    toast(isEdit ? 'Utilisateur modifié' : 'Utilisateur créé', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+});
+
+document.getElementById('cancelGroupEdit').addEventListener('click', () => {
+  resetGroupFormMode();
+});
+
+document.getElementById('cancelUserEdit').addEventListener('click', () => {
+  resetUserFormMode();
+});
+
 document.getElementById('logoutBtn').addEventListener('click', async () => {
   try {
     await fetch(API + '/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
@@ -761,6 +1073,14 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
 });
 document.getElementById('historySearch').addEventListener('input', renderHistory);
 document.getElementById('historyFilter').addEventListener('change', renderHistory);
+document.getElementById('historyList').addEventListener('scroll', () => {
+  const container = document.getElementById('historyList');
+  if (document.getElementById('historyModal').hidden) return;
+  if (historyRenderedCount >= historyFilteredList.length) return;
+  if (container.scrollTop + container.clientHeight >= container.scrollHeight - 120) {
+    renderHistoryChunk(false);
+  }
+});
 
 function renderHistory() {
   const q = document.getElementById('historySearch').value.toLowerCase().trim();
@@ -783,7 +1103,7 @@ function renderHistory() {
     const eq = equipmentAll.find(x => x.id === r.equipment_id);
     const eqName = eq ? eq.name : (r.equipment_name_snapshot || '(équipement supprimé)');
     const eqArchived = !!eq?.archived_at;
-    const e = parseISODate(r.end_date);
+    const e = rentalEffectiveEndDate(r);
     let status = 'active';
     if (r.returned_at) status = 'returned';
     else if (e && e < today) status = 'late';
@@ -804,8 +1124,14 @@ function renderHistory() {
 
   const stats = {
     total: rentals.length,
-    active: rentals.filter(r => !r.returned_at && parseISODate(r.end_date) >= today).length,
-    late: rentals.filter(r => !r.returned_at && parseISODate(r.end_date) < today).length,
+    active: rentals.filter(r => {
+      const effectiveEnd = rentalEffectiveEndDate(r);
+      return !r.returned_at && effectiveEnd && effectiveEnd >= today;
+    }).length,
+    late: rentals.filter(r => {
+      const effectiveEnd = rentalEffectiveEndDate(r);
+      return !r.returned_at && effectiveEnd && effectiveEnd < today;
+    }).length,
     returned: rentals.filter(r => r.returned_at).length,
     archivedEq: equipmentAll.filter(e => e.archived_at).length
   };
@@ -818,42 +1144,87 @@ function renderHistory() {
   `;
 
   const container = document.getElementById('historyList');
-  if (list.length === 0) {
-    container.innerHTML = '<div class="history-empty">Aucun résultat</div>';
-    return;
-  }
+  historyFilteredList = list;
+  historyRenderedCount = 0;
+  renderHistoryChunk(true);
+}
 
-  container.innerHTML = list.map(r => {
-    const start = parseISODate(r.start_date);
-    const end = parseISODate(r.end_date);
-    const nbDays = daysBetween(start, end) + 1;
-    const statusLabel = r.status === 'active' ? 'En cours' : r.status === 'late' ? 'En retard' : 'Retournée';
-    const returnedInfo = r.returned_at ? ` · Retourné le ${new Date(r.returned_at).toLocaleDateString('fr-CA')}` : '';
-    const archivedBadge = r.eqArchived ? ' <span class="mini-badge">équipement archivé</span>' : '';
-    return `
-      <div class="history-item ${r.status}" data-id="${r.id}">
-        <div>
-          <div class="item-title">${escapeHtml(r.client)} — ${escapeHtml(r.eqName)}${archivedBadge}</div>
-          <div class="item-details">
-            📅 ${fmtDateFull(start)} → ${fmtDateFull(end)} (${nbDays}j)${returnedInfo}
-            ${r.phone ? ` · 📞 ${escapeHtml(r.phone)}` : ''}
-            ${r.note ? `<br>📝 ${escapeHtml(r.note)}` : ''}
-          </div>
+function buildHistoryItemHtml(r) {
+  const start = parseISODate(r.start_date);
+  const end = parseISODate(r.end_date);
+  const nbDays = daysBetween(start, end) + 1;
+  const statusLabel = r.status === 'active' ? 'En cours' : r.status === 'late' ? 'En retard' : 'Retournée';
+  const returnedInfo = r.returned_at ? ` · Retourné le ${new Date(r.returned_at).toLocaleDateString('fr-CA')}` : '';
+  const createdByInfo = r.created_by ? `Créée par ${escapeHtml(r.created_by)}` : '';
+  const returnedByInfo = r.returned_by ? `Retour confirmé par ${escapeHtml(r.returned_by)}` : '';
+  const auditLine = (createdByInfo || returnedByInfo)
+    ? `<br>👤 ${createdByInfo}${createdByInfo && returnedByInfo ? ' · ' : ''}${returnedByInfo}`
+    : '';
+  const archivedBadge = r.eqArchived ? ' <span class="mini-badge">équipement archivé</span>' : '';
+  return `
+    <div class="history-item ${r.status}" data-id="${r.id}">
+      <div>
+        <div class="item-title">${escapeHtml(r.client)} — ${escapeHtml(r.eqName)}${archivedBadge}</div>
+        <div class="item-details">
+          📅 ${fmtDateFull(start)} → ${fmtDateFull(end)} (${nbDays}j)${returnedInfo}
+          ${auditLine}
+          ${r.phone ? ` · 📞 ${escapeHtml(r.phone)}` : ''}
+          ${r.note ? `<br>📝 ${escapeHtml(r.note)}` : ''}
         </div>
-        <span class="item-status status-${r.status}">${statusLabel}</span>
       </div>
-    `;
-  }).join('');
+      <span class="item-status status-${r.status}">${statusLabel}</span>
+    </div>
+  `;
+}
 
-  container.querySelectorAll('.history-item').forEach(el => {
+function wireHistoryItemClicks(container) {
+  container.querySelectorAll('.history-item').forEach((el) => {
+    if (el.dataset.bound === '1') return;
+    el.dataset.bound = '1';
     el.addEventListener('click', () => {
-      const rental = rentals.find(r => r.id === el.dataset.id);
+      const rental = rentals.find((r) => r.id === el.dataset.id);
       if (rental) {
         closeModal('historyModal');
         openPostitModal(rental);
       }
     });
   });
+}
+
+function renderHistoryChunk(reset = false) {
+  const container = document.getElementById('historyList');
+  if (reset) {
+    container.innerHTML = '';
+    container.scrollTop = 0;
+    historyRenderedCount = 0;
+  }
+
+  if (historyFilteredList.length === 0) {
+    container.innerHTML = '<div class="history-empty">Aucun résultat</div>';
+    return;
+  }
+
+  const chunk = historyFilteredList.slice(historyRenderedCount, historyRenderedCount + HISTORY_PAGE_SIZE);
+  if (chunk.length > 0) {
+    container.insertAdjacentHTML('beforeend', chunk.map(buildHistoryItemHtml).join(''));
+    historyRenderedCount += chunk.length;
+    wireHistoryItemClicks(container);
+  }
+
+  const existingMore = container.querySelector('.history-load-more-wrap');
+  if (existingMore) existingMore.remove();
+  if (historyRenderedCount < historyFilteredList.length) {
+    const remaining = historyFilteredList.length - historyRenderedCount;
+    container.insertAdjacentHTML('beforeend', `
+      <div class="history-load-more-wrap">
+        <button type="button" class="btn btn-outline btn-sm history-load-more-btn">Afficher plus (${remaining})</button>
+      </div>
+    `);
+    const moreBtn = container.querySelector('.history-load-more-btn');
+    if (moreBtn) {
+      moreBtn.addEventListener('click', () => renderHistoryChunk(false));
+    }
+  }
 }
 
 function renderArchivedEquipment(q) {
@@ -878,7 +1249,7 @@ function renderArchivedEquipment(q) {
             ${count} location(s) dans l'historique · Archivé le ${new Date(e.archived_at).toLocaleDateString('fr-CA')}
           </div>
         </div>
-        <button class="btn btn-outline btn-sm restore-btn" data-id="${e.id}">Restaurer</button>
+        ${hasPermission('create_equipment') ? `<button class="btn btn-outline btn-sm restore-btn" data-id="${e.id}">Restaurer</button>` : ''}
       </div>
     `;
   }).join('');
@@ -916,7 +1287,13 @@ document.getElementById('todayBtn').addEventListener('click', () => {
   currentWeekStart = getMonday(new Date());
   render();
 });
-document.getElementById('addRowBtn').addEventListener('click', () => openRowModal(null));
+document.getElementById('addRowBtn').addEventListener('click', () => {
+  if (!hasPermission('create_equipment')) {
+    toast('Vous n\'avez pas la permission de créer des équipements.', 'error');
+    return;
+  }
+  openRowModal(null);
+});
 
 // =========================================================
 // MODAL HELPERS — fermeture protégée
@@ -929,12 +1306,14 @@ document.querySelectorAll('[data-close]').forEach(el => {
   });
 });
 
-// Cliquer sur le fond du modal ne le ferme PAS accidentellement.
-document.querySelectorAll('.modal').forEach(modal => {
-  modal.addEventListener('click', async (e) => {
-    if (e.target === modal) {
-      if (await confirmDiscardIfDirty(modal)) modal.hidden = true;
-    }
+// Fermer sur clic explicite du backdrop.
+document.querySelectorAll('.modal-backdrop').forEach(backdrop => {
+  backdrop.addEventListener('click', async (e) => {
+    const modal = e.target.closest('.modal');
+    if (!modal) return;
+    const ignoreUntil = Number(modal.dataset.ignoreBackdropUntil || '0');
+    if (Date.now() < ignoreUntil) return;
+    if (await confirmDiscardIfDirty(modal)) modal.hidden = true;
   });
 });
 
@@ -1071,4 +1450,11 @@ function wireFrenchValidation() {
 // =========================================================
 // INIT
 // =========================================================
-loadAll().then(() => { connectSSE(); wireFrenchValidation(); });
+const settingsBtnInit = document.getElementById('settingsBtn');
+if (settingsBtnInit) settingsBtnInit.hidden = true;
+const addRowBtnInit = document.getElementById('addRowBtn');
+if (addRowBtnInit) addRowBtnInit.hidden = true;
+
+loadSession().then(() => {
+  loadAll().then(() => { connectSSE(); wireFrenchValidation(); });
+});

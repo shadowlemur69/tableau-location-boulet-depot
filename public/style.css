@@ -264,8 +264,35 @@ h1, h2, h3, h4 { margin: 0; font-family: 'Barlow Condensed', 'Inter', sans-serif
   align-items: center;
   gap: 14px;
   transition: transform 0.15s, box-shadow 0.15s;
+  position: relative;
 }
 .stat-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.stat-card.stat-card-clickable { cursor: pointer; }
+.stat-card.stat-card-clickable::after {
+  content: "↗";
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--brand-dark);
+  background: var(--brand-green-soft);
+  border: 1px solid rgba(139, 197, 63, 0.45);
+  opacity: 0.95;
+}
+.stat-card.stat-card-clickable:hover::after {
+  background: var(--brand-green);
+}
+.stat-card.stat-card-clickable:focus-visible {
+  outline: 2px solid var(--brand-green);
+  outline-offset: 2px;
+}
 
 .stat-icon {
   width: 40px;
@@ -698,6 +725,18 @@ main {
   gap: 8px;
 }
 
+.return-info {
+  margin-top: -8px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background: rgba(139, 197, 63, 0.12);
+  border: 1px solid rgba(139, 197, 63, 0.35);
+  border-radius: 6px;
+  color: var(--brand-dark);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .modal-card form label {
   display: block;
   font-size: 12px;
@@ -750,6 +789,82 @@ main {
    HISTORIQUE
    ============================================================ */
 .history-modal { max-width: 900px; }
+.settings-modal { max-width: 920px; }
+.settings-section {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 14px;
+  background: var(--surface-2);
+}
+.settings-section h3 {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-size: 20px;
+  color: var(--brand-dark);
+  margin-bottom: 10px;
+}
+.settings-form {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+}
+.perm-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 8px 14px;
+  margin-top: 6px;
+}
+.perm-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.perm-grid input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+}
+.settings-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+.settings-item {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.settings-item-title {
+  font-weight: 700;
+  color: var(--ink);
+  font-size: 14px;
+}
+.settings-item-sub {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.settings-item-actions {
+  margin-top: 8px;
+}
+.btn-edit {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+.perm-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  margin-right: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: white;
+  font-size: 11px;
+  color: var(--ink-2);
+}
 
 .history-controls {
   display: flex;
@@ -852,6 +967,11 @@ main {
   color: var(--ink-soft);
   font-size: 15px;
 }
+.history-load-more-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 16px;
+}
 
 /* ============================================================
    TOAST
@@ -894,6 +1014,7 @@ main {
   main { padding: 12px 16px 24px; }
   .board { min-width: 800px; }
   .grid-2 { grid-template-columns: 1fr; }
+  .perm-grid { grid-template-columns: 1fr; }
 }
 
 /* ===== NOUVEAUX COMPOSANTS (audit robustesse) ===== */

@@ -44,6 +44,13 @@ const LIMITS = {
 const VALID_COLORS = ['yellow', 'pink', 'blue', 'green', 'orange', 'purple'];
 const MIN_DATE = '2000-01-01';
 const MAX_DATE = '2099-12-31';
+const AUTH_ENABLED = (process.env.TABLEAU_AUTH_ENABLED || '1') !== '0';
+const AUTH_USER = (process.env.TABLEAU_USER || 'admin').trim();
+const AUTH_PASSWORD = (process.env.TABLEAU_PASSWORD || '').trim();
+const SESSION_SECRET = (process.env.TABLEAU_SESSION_SECRET || AUTH_PASSWORD || 'tableau-dev-insecure').trim();
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const COOKIE_SECURE = process.env.NODE_ENV === 'production';
+const AUTH_PERMISSIONS = ['admin', 'create_rental', 'create_equipment', 'undo_return', 'confirm_return'];
 
 // ---------- BASE DE DONNEES ----------
 const db = new DatabaseSync(DB_PATH);
@@ -65,6 +72,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     equipment_id TEXT NOT NULL,
     equipment_name_snapshot TEXT,
+    created_by TEXT,
     client TEXT NOT NULL,
     phone TEXT,
     start_date TEXT NOT NULL,
@@ -72,6 +80,7 @@ db.exec(`
     note TEXT,
     color TEXT DEFAULT 'yellow',
     returned_at INTEGER,
+    returned_by TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     version INTEGER DEFAULT 1
@@ -79,6 +88,28 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_rentals_equipment ON rentals(equipment_id);
   CREATE INDEX IF NOT EXISTS idx_rentals_dates ON rentals(start_date, end_date);
+
+  CREATE TABLE IF NOT EXISTS auth_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    full_name TEXT NOT NULL,
+    permissions_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS auth_users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES auth_groups(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_auth_users_username ON auth_users(username);
+  CREATE INDEX IF NOT EXISTS idx_auth_users_group_id ON auth_users(group_id);
 `);
 
 // Migrations légères (colonnes ajoutées après coup)
@@ -90,8 +121,10 @@ function ensureColumn(table, col, ddl) {
 }
 ensureColumn('equipment', 'archived_at', 'archived_at INTEGER');
 ensureColumn('rentals', 'equipment_name_snapshot', 'equipment_name_snapshot TEXT');
+ensureColumn('rentals', 'created_by', 'created_by TEXT');
 ensureColumn('rentals', 'updated_at', 'updated_at INTEGER NOT NULL DEFAULT 0');
 ensureColumn('rentals', 'version', 'version INTEGER NOT NULL DEFAULT 1');
+ensureColumn('rentals', 'returned_by', 'returned_by TEXT');
 
 // ---------- HELPERS ----------
 function uid() { return crypto.randomBytes(8).toString('hex'); }
@@ -126,29 +159,68 @@ function isoDateToTimestamp(dateStr) {
 app.use(express.json({ limit: '256kb' }));
 
 // ---------- AUTHENTIFICATION ----------
-const AUTH_USER = (process.env.TABLEAU_USER || 'equipe').trim();
-const AUTH_PASSWORD = (process.env.TABLEAU_PASSWORD || '').trim();
-const SESSION_SECRET = (process.env.TABLEAU_SESSION_SECRET || AUTH_PASSWORD || 'tableau-dev-insecure').trim();
-const AUTH_ENABLED = AUTH_PASSWORD.length > 0;
-const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const COOKIE_SECURE = process.env.NODE_ENV === 'production';
-
-function parseCookies(req) {
-  const header = req.headers.cookie;
-  if (!header) return {};
-  return Object.fromEntries(
-    header.split(';').map((part) => {
-      const idx = part.indexOf('=');
-      if (idx === -1) return [part.trim(), ''];
-      const key = part.slice(0, idx).trim();
-      const val = part.slice(idx + 1).trim();
-      try { return [key, decodeURIComponent(val)]; } catch { return [key, val]; }
-    })
-  );
+function normalizePermissions(raw) {
+  const normalized = Object.fromEntries(AUTH_PERMISSIONS.map((p) => [p, false]));
+  if (!raw || typeof raw !== 'object') return normalized;
+  for (const p of AUTH_PERMISSIONS) normalized[p] = !!raw[p];
+  if (normalized.admin) {
+    for (const p of AUTH_PERMISSIONS) normalized[p] = true;
+  }
+  return normalized;
 }
 
-function signSession(user) {
-  const payload = JSON.stringify({ user, exp: Date.now() + SESSION_MAX_AGE_MS });
+function parsePermissions(jsonText) {
+  try {
+    return normalizePermissions(JSON.parse(jsonText || '{}'));
+  } catch {
+    return normalizePermissions({});
+  }
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const key = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `scrypt$${salt}$${key}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (typeof storedHash !== 'string' || !storedHash.startsWith('scrypt$')) return false;
+  const parts = storedHash.split('$');
+  if (parts.length !== 3) return false;
+  const salt = parts[1];
+  const expectedHex = parts[2];
+  const gotHex = crypto.scryptSync(password, salt, 64).toString('hex');
+  if (expectedHex.length !== gotHex.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(expectedHex, 'hex'), Buffer.from(gotHex, 'hex'));
+}
+
+function getUserWithGroupByUsername(username) {
+  return db.prepare(`
+    SELECT u.id, u.username, u.full_name, u.password_hash, u.active,
+           g.id as group_id, g.name as group_name, g.full_name as group_full_name, g.permissions_json
+    FROM auth_users u
+    JOIN auth_groups g ON g.id = u.group_id
+    WHERE LOWER(u.username) = LOWER(?)
+    LIMIT 1
+  `).get(username);
+}
+
+function toSessionUser(row) {
+  const permissions = parsePermissions(row.permissions_json);
+  return {
+    id: row.id,
+    username: row.username,
+    full_name: row.full_name,
+    group_id: row.group_id,
+    group_name: row.group_name,
+    group_full_name: row.group_full_name,
+    permissions,
+    is_admin: !!permissions.admin
+  };
+}
+
+function signSession(sessionUser) {
+  const payload = JSON.stringify({ ...sessionUser, exp: Date.now() + SESSION_MAX_AGE_MS });
   const payloadB64 = Buffer.from(payload).toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payloadB64).digest('base64url');
   return `${payloadB64}.${sig}`;
@@ -165,15 +237,17 @@ function verifySession(token) {
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
   try {
     const data = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    if (!data?.user || !data?.exp || Date.now() > data.exp) return null;
+    if (!data?.username || !data?.exp || Date.now() > data.exp) return null;
+    data.permissions = normalizePermissions(data.permissions || {});
+    data.is_admin = !!data.permissions.admin;
     return data;
   } catch {
     return null;
   }
 }
 
-function setSessionCookie(res, user) {
-  const token = signSession(user);
+function setSessionCookie(res, sessionUser) {
+  const token = signSession(sessionUser);
   const parts = [
     `tableau_session=${encodeURIComponent(token)}`,
     'Path=/',
@@ -183,6 +257,66 @@ function setSessionCookie(res, user) {
   ];
   if (COOKIE_SECURE) parts.push('Secure');
   res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function ensureAuthBootstrap() {
+  const adminPerms = normalizePermissions({
+    admin: true,
+    create_rental: true,
+    create_equipment: true,
+    undo_return: true,
+    confirm_return: true
+  });
+  let adminGroup = db.prepare('SELECT * FROM auth_groups WHERE name = ?').get('admins');
+  if (!adminGroup) {
+    const row = {
+      id: uid(),
+      name: 'admins',
+      full_name: 'Administrateurs',
+      permissions_json: JSON.stringify(adminPerms),
+      created_at: now()
+    };
+    db.prepare('INSERT INTO auth_groups (id, name, full_name, permissions_json, created_at) VALUES (@id, @name, @full_name, @permissions_json, @created_at)').run(row);
+    adminGroup = row;
+  }
+
+  const userCount = db.prepare('SELECT COUNT(*) as c FROM auth_users').get().c;
+  if (userCount > 0) return;
+
+  const bootstrapPassword = AUTH_PASSWORD || crypto.randomBytes(6).toString('hex');
+  const bootstrapUser = {
+    id: uid(),
+    username: AUTH_USER || 'admin',
+    password_hash: hashPassword(bootstrapPassword),
+    full_name: 'Administrateur',
+    group_id: adminGroup.id,
+    active: 1,
+    created_at: now()
+  };
+  db.prepare(`INSERT INTO auth_users
+    (id, username, password_hash, full_name, group_id, active, created_at)
+    VALUES (@id, @username, @password_hash, @full_name, @group_id, @active, @created_at)`)
+    .run(bootstrapUser);
+
+  if (!AUTH_PASSWORD) {
+    console.log(`  ⚠ Aucun TABLEAU_PASSWORD défini. Compte bootstrap créé: ${bootstrapUser.username} / ${bootstrapPassword}`);
+  }
+}
+
+ensureAuthBootstrap();
+
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  if (!header) return {};
+  return Object.fromEntries(
+    header.split(';').map((part) => {
+      const idx = part.indexOf('=');
+      if (idx === -1) return [part.trim(), ''];
+      const key = part.slice(0, idx).trim();
+      const val = part.slice(idx + 1).trim();
+      try { return [key, decodeURIComponent(val)]; } catch { return [key, val]; }
+    })
+  );
 }
 
 function clearSessionCookie(res) {
@@ -202,7 +336,8 @@ function requireAuth(req, res, next) {
   if (!AUTH_ENABLED || isPublicPath(req.path)) return next();
   const session = verifySession(parseCookies(req).tableau_session);
   if (session) {
-    req.tableauUser = session.user;
+    req.auth = session;
+    req.tableauUser = session.username;
     return next();
   }
   if (req.path.startsWith('/api/')) {
@@ -213,16 +348,28 @@ function requireAuth(req, res, next) {
 
 app.post('/api/auth/login', (req, res) => {
   if (!AUTH_ENABLED) {
-    setSessionCookie(res, AUTH_USER);
+    setSessionCookie(res, {
+      id: 'open-mode',
+      username: AUTH_USER,
+      full_name: AUTH_USER,
+      group_id: 'open-mode',
+      group_name: 'open',
+      group_full_name: 'Open Mode',
+      permissions: normalizePermissions({ admin: true }),
+      is_admin: true
+    });
     return res.json({ ok: true, user: AUTH_USER });
   }
   const user = cleanStr(req.body?.user, 80);
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (user === AUTH_USER && password === AUTH_PASSWORD) {
-    setSessionCookie(res, user);
-    return res.json({ ok: true, user });
+  if (!user || !password) return res.status(401).json({ error: 'Identifiants incorrects.' });
+  const row = getUserWithGroupByUsername(user);
+  if (!row || !row.active || !verifyPassword(password, row.password_hash)) {
+    return res.status(401).json({ error: 'Identifiants incorrects.' });
   }
-  return res.status(401).json({ error: 'Identifiants incorrects.' });
+  const sessionUser = toSessionUser(row);
+  setSessionCookie(res, sessionUser);
+  return res.json({ ok: true, user: sessionUser.username, full_name: sessionUser.full_name, is_admin: sessionUser.is_admin, permissions: sessionUser.permissions });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -234,7 +381,187 @@ app.get('/api/auth/session', (req, res) => {
   if (!AUTH_ENABLED) return res.json({ ok: true, user: AUTH_USER, auth: false });
   const session = verifySession(parseCookies(req).tableau_session);
   if (!session) return res.status(401).json({ ok: false });
-  return res.json({ ok: true, user: session.user, auth: true });
+  return res.json({
+    ok: true,
+    auth: true,
+    user: session.username,
+    full_name: session.full_name,
+    group_name: session.group_name,
+    group_full_name: session.group_full_name,
+    is_admin: session.is_admin,
+    permissions: session.permissions
+  });
+});
+
+function requireAdmin(req, res, next) {
+  if (!AUTH_ENABLED) return next();
+  if (req.auth?.is_admin) return next();
+  return res.status(403).json({ error: 'Accès admin requis.' });
+}
+
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!AUTH_ENABLED) return next();
+    if (req.auth?.is_admin) return next();
+    if (req.auth?.permissions?.[permission]) return next();
+    return res.status(403).json({ error: 'Permission insuffisante.' });
+  };
+}
+
+app.get('/api/admin/groups', requireAuth, requireAdmin, (req, res) => {
+  const rows = db.prepare('SELECT * FROM auth_groups ORDER BY name ASC').all();
+  const groups = rows.map((g) => ({
+    id: g.id,
+    name: g.name,
+    full_name: g.full_name,
+    permissions: parsePermissions(g.permissions_json),
+    created_at: g.created_at
+  }));
+  res.json(groups);
+});
+
+app.post('/api/admin/groups', requireAuth, requireAdmin, (req, res) => {
+  const nameRaw = cleanStr(req.body?.name, 40);
+  const fullName = cleanStr(req.body?.full_name, 120);
+  if (!nameRaw || !fullName) return res.status(400).json({ error: 'Nom de groupe et nom complet requis.' });
+  const name = nameRaw.toLowerCase();
+  if (!/^[a-z0-9_-]{2,40}$/.test(name)) {
+    return res.status(400).json({ error: 'Group name invalide (a-z, 0-9, _, -).' });
+  }
+  const exists = db.prepare('SELECT id FROM auth_groups WHERE name = ?').get(name);
+  if (exists) return res.status(409).json({ error: 'Ce group name existe déjà.' });
+
+  const row = {
+    id: uid(),
+    name,
+    full_name: fullName,
+    permissions_json: JSON.stringify(normalizePermissions(req.body?.permissions || {})),
+    created_at: now()
+  };
+  db.prepare('INSERT INTO auth_groups (id, name, full_name, permissions_json, created_at) VALUES (@id, @name, @full_name, @permissions_json, @created_at)').run(row);
+  res.json({ id: row.id, name: row.name, full_name: row.full_name, permissions: parsePermissions(row.permissions_json), created_at: row.created_at });
+});
+
+app.put('/api/admin/groups/:id', requireAuth, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM auth_groups WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Groupe introuvable.' });
+
+  const nameRaw = cleanStr(req.body?.name, 40);
+  const fullName = cleanStr(req.body?.full_name, 120);
+  if (!nameRaw || !fullName) return res.status(400).json({ error: 'Nom de groupe et nom complet requis.' });
+  const name = nameRaw.toLowerCase();
+  if (!/^[a-z0-9_-]{2,40}$/.test(name)) {
+    return res.status(400).json({ error: 'Group name invalide (a-z, 0-9, _, -).' });
+  }
+
+  const dup = db.prepare('SELECT id FROM auth_groups WHERE name = ? AND id != ?').get(name, id);
+  if (dup) return res.status(409).json({ error: 'Ce group name existe déjà.' });
+
+  const permissions = normalizePermissions(req.body?.permissions || {});
+  db.prepare('UPDATE auth_groups SET name = ?, full_name = ?, permissions_json = ? WHERE id = ?')
+    .run(name, fullName, JSON.stringify(permissions), id);
+
+  const updated = db.prepare('SELECT * FROM auth_groups WHERE id = ?').get(id);
+  res.json({
+    id: updated.id,
+    name: updated.name,
+    full_name: updated.full_name,
+    permissions: parsePermissions(updated.permissions_json),
+    created_at: updated.created_at
+  });
+});
+
+app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT u.id, u.username, u.full_name, u.active, u.created_at,
+           g.id as group_id, g.name as group_name, g.full_name as group_full_name
+    FROM auth_users u
+    JOIN auth_groups g ON g.id = u.group_id
+    ORDER BY u.username ASC
+  `).all();
+  res.json(rows);
+});
+
+app.post('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
+  const usernameRaw = cleanStr(req.body?.username, 80);
+  const fullName = cleanStr(req.body?.full_name, 120);
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const groupId = cleanStr(req.body?.group_id, 80);
+  if (!usernameRaw || !fullName || !password || !groupId) {
+    return res.status(400).json({ error: 'username, password, full name et groupe sont requis.' });
+  }
+  const username = usernameRaw.toLowerCase();
+  if (!/^[a-z0-9._-]{3,80}$/.test(username)) {
+    return res.status(400).json({ error: 'Username invalide.' });
+  }
+  if (password.length < 8) return res.status(400).json({ error: 'Le mot de passe doit avoir au moins 8 caractères.' });
+
+  const group = db.prepare('SELECT id FROM auth_groups WHERE id = ?').get(groupId);
+  if (!group) return res.status(404).json({ error: 'Groupe introuvable.' });
+  const exists = db.prepare('SELECT id FROM auth_users WHERE LOWER(username) = LOWER(?)').get(username);
+  if (exists) return res.status(409).json({ error: 'Ce username existe déjà.' });
+
+  const row = {
+    id: uid(),
+    username,
+    password_hash: hashPassword(password),
+    full_name: fullName,
+    group_id: groupId,
+    active: 1,
+    created_at: now()
+  };
+  db.prepare(`INSERT INTO auth_users
+    (id, username, password_hash, full_name, group_id, active, created_at)
+    VALUES (@id, @username, @password_hash, @full_name, @group_id, @active, @created_at)`)
+    .run(row);
+  res.json({ id: row.id, username: row.username, full_name: row.full_name, group_id: row.group_id, active: row.active, created_at: row.created_at });
+});
+
+app.put('/api/admin/users/:id', requireAuth, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM auth_users WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+
+  const usernameRaw = cleanStr(req.body?.username, 80);
+  const fullName = cleanStr(req.body?.full_name, 120);
+  const groupId = cleanStr(req.body?.group_id, 80);
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+  if (!usernameRaw || !fullName || !groupId) {
+    return res.status(400).json({ error: 'username, full name et groupe sont requis.' });
+  }
+
+  const username = usernameRaw.toLowerCase();
+  if (!/^[a-z0-9._-]{3,80}$/.test(username)) {
+    return res.status(400).json({ error: 'Username invalide.' });
+  }
+
+  const group = db.prepare('SELECT id FROM auth_groups WHERE id = ?').get(groupId);
+  if (!group) return res.status(404).json({ error: 'Groupe introuvable.' });
+
+  const dup = db.prepare('SELECT id FROM auth_users WHERE LOWER(username) = LOWER(?) AND id != ?').get(username, id);
+  if (dup) return res.status(409).json({ error: 'Ce username existe déjà.' });
+
+  if (password && password.length < 8) {
+    return res.status(400).json({ error: 'Le mot de passe doit avoir au moins 8 caractères.' });
+  }
+
+  const passwordHash = password ? hashPassword(password) : existing.password_hash;
+
+  db.prepare('UPDATE auth_users SET username = ?, password_hash = ?, full_name = ?, group_id = ? WHERE id = ?')
+    .run(username, passwordHash, fullName, groupId, id);
+
+  const updated = db.prepare(`
+    SELECT u.id, u.username, u.full_name, u.active, u.created_at,
+           g.id as group_id, g.name as group_name, g.full_name as group_full_name
+    FROM auth_users u
+    JOIN auth_groups g ON g.id = u.group_id
+    WHERE u.id = ?
+    LIMIT 1
+  `).get(id);
+
+  res.json(updated);
 });
 
 app.use(requireAuth);
@@ -306,7 +633,7 @@ app.get('/api/equipment', (req, res) => {
   res.json(db.prepare(q).all());
 });
 
-app.post('/api/equipment', (req, res) => {
+app.post('/api/equipment', requirePermission('create_equipment'), (req, res) => {
   const name = cleanStr(req.body?.name, LIMITS.name);
   if (!name) return res.status(400).json({ error: 'Le nom de l\'équipement est requis.' });
   const category = cleanStr(req.body?.category, LIMITS.category);
@@ -325,7 +652,7 @@ app.post('/api/equipment', (req, res) => {
   res.json(row);
 });
 
-app.put('/api/equipment/:id', (req, res) => {
+app.put('/api/equipment/:id', requirePermission('create_equipment'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Équipement introuvable.' });
@@ -350,7 +677,7 @@ app.put('/api/equipment/:id', (req, res) => {
 
 // Archivage (soft delete) : conserve l'historique intact.
 // Refuse si des locations non-retournées existent (sauf si ?force=1).
-app.delete('/api/equipment/:id', (req, res) => {
+app.delete('/api/equipment/:id', requirePermission('create_equipment'), (req, res) => {
   const { id } = req.params;
   const force = req.query.force === '1';
   const existing = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
@@ -380,7 +707,7 @@ app.delete('/api/equipment/:id', (req, res) => {
 });
 
 // Restauration
-app.post('/api/equipment/:id/restore', (req, res) => {
+app.post('/api/equipment/:id/restore', requirePermission('create_equipment'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Équipement introuvable.' });
@@ -433,7 +760,7 @@ function validateRentalPayload(body, { forCreate }) {
   return { errors, clean: { client, phone, note, color, start_date, end_date } };
 }
 
-app.post('/api/rentals', (req, res) => {
+app.post('/api/rentals', requirePermission('create_rental'), (req, res) => {
   const { errors, clean } = validateRentalPayload(req.body, { forCreate: true });
   if (errors.length) return res.status(400).json({ error: errors.join(' ') });
 
@@ -457,6 +784,7 @@ app.post('/api/rentals', (req, res) => {
     id: uid(),
     equipment_id,
     equipment_name_snapshot: eq.name,
+    created_by: req.auth?.username || AUTH_USER || 'system',
     client: clean.client,
     phone: clean.phone,
     start_date: clean.start_date,
@@ -464,19 +792,20 @@ app.post('/api/rentals', (req, res) => {
     note: clean.note,
     color: clean.color,
     returned_at: null,
+    returned_by: null,
     created_at: ts,
     updated_at: ts,
     version: 1
   };
   db.prepare(`INSERT INTO rentals
-    (id, equipment_id, equipment_name_snapshot, client, phone, start_date, end_date, note, color, returned_at, created_at, updated_at, version)
-    VALUES (@id, @equipment_id, @equipment_name_snapshot, @client, @phone, @start_date, @end_date, @note, @color, @returned_at, @created_at, @updated_at, @version)`
+    (id, equipment_id, equipment_name_snapshot, created_by, client, phone, start_date, end_date, note, color, returned_at, returned_by, created_at, updated_at, version)
+    VALUES (@id, @equipment_id, @equipment_name_snapshot, @created_by, @client, @phone, @start_date, @end_date, @note, @color, @returned_at, @returned_by, @created_at, @updated_at, @version)`
   ).run(row);
   broadcast('rentals:changed', { action: 'created', item: row });
   res.json(row);
 });
 
-app.put('/api/rentals/:id', (req, res) => {
+app.put('/api/rentals/:id', requirePermission('create_rental'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
@@ -511,15 +840,20 @@ app.put('/api/rentals/:id', (req, res) => {
   if (req.body?.returned_at !== undefined && returned_at === null) {
     return res.status(400).json({ error: 'Date de retour invalide.' });
   }
+  let returned_by = existing.returned_by;
+  if (req.body?.returned_at !== undefined) {
+    if (returned_at === null) returned_by = null;
+    else returned_by = req.auth?.username || existing.returned_by || AUTH_USER || 'system';
+  }
   const ts = now();
-  db.prepare(`UPDATE rentals SET client=?, phone=?, start_date=?, end_date=?, note=?, color=?, returned_at=?, updated_at=?, version=version+1 WHERE id=?`)
-    .run(clean.client, clean.phone, clean.start_date, clean.end_date, clean.note, clean.color, returned_at, ts, id);
+  db.prepare(`UPDATE rentals SET client=?, phone=?, start_date=?, end_date=?, note=?, color=?, returned_at=?, returned_by=?, updated_at=?, version=version+1 WHERE id=?`)
+    .run(clean.client, clean.phone, clean.start_date, clean.end_date, clean.note, clean.color, returned_at, returned_by, ts, id);
   const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   broadcast('rentals:changed', { action: 'updated', item: updated });
   res.json(updated);
 });
 
-app.post('/api/rentals/:id/return', (req, res) => {
+app.post('/api/rentals/:id/return', requirePermission('confirm_return'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
@@ -530,25 +864,26 @@ app.post('/api/rentals/:id/return', (req, res) => {
     return res.status(400).json({ error: 'La date de retour ne peut pas être avant la date de début.' });
   }
   const ts = now();
-  db.prepare('UPDATE rentals SET returned_at = ?, updated_at = ?, version = version + 1 WHERE id = ?').run(returnedAt, ts, id);
+  const returnedBy = req.auth?.username || AUTH_USER || 'system';
+  db.prepare('UPDATE rentals SET returned_at = ?, returned_by = ?, updated_at = ?, version = version + 1 WHERE id = ?').run(returnedAt, returnedBy, ts, id);
   const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   broadcast('rentals:changed', { action: 'updated', item: updated });
   res.json(updated);
 });
 
 // Ré-ouvrir une location retournée (annuler un retour marqué par erreur)
-app.post('/api/rentals/:id/unreturn', (req, res) => {
+app.post('/api/rentals/:id/unreturn', requirePermission('undo_return'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
   const ts = now();
-  db.prepare('UPDATE rentals SET returned_at = NULL, updated_at = ?, version = version + 1 WHERE id = ?').run(ts, id);
+  db.prepare('UPDATE rentals SET returned_at = NULL, returned_by = NULL, updated_at = ?, version = version + 1 WHERE id = ?').run(ts, id);
   const updated = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   broadcast('rentals:changed', { action: 'updated', item: updated });
   res.json(updated);
 });
 
-app.delete('/api/rentals/:id', (req, res) => {
+app.delete('/api/rentals/:id', requirePermission('create_rental'), (req, res) => {
   const { id } = req.params;
   const existing = db.prepare('SELECT * FROM rentals WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Location introuvable.' });
